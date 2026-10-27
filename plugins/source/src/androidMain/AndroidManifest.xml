@@ -3,6 +3,15 @@
 
     <uses-permission android:name="com.dexcom.cgm.EXTERNAL_PERMISSION" />
 
+    <queries>
+        <package android:name="com.dexcom.g6.region1.mmol" />
+        <package android:name="com.dexcom.g6.region2.mgdl" />
+        <package android:name="com.dexcom.g6.region3.mgdl" />
+        <package android:name="com.dexcom.g6.region3.mmol" />
+        <package android:name="com.dexcom.g6" />
+        <package android:name="com.dexcom.g7" />
+    </queries>
+
     <application>
 
         <activity

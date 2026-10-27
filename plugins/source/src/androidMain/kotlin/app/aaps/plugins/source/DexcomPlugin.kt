@@ -3,6 +3,7 @@ package app.aaps.plugins.source
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.core.content.ContextCompat
@@ -51,6 +52,7 @@ import dev.zacsweers.metro.SingleIn
 import dev.zacsweers.metro.binding
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import java.security.MessageDigest
 import kotlin.math.abs
 
 @ContributesIntoMap(AppScope::class, binding = binding<PluginBase>())
@@ -90,7 +92,7 @@ class DexcomPlugin(
     }
 
     override fun requiredPermissions(): List<PermissionGroup> =
-        if (isDexcomAppInstalled()) listOf(
+        if (dexcomPermissionState() == DexcomPermissionState.REQUIRED) listOf(
             PermissionGroup(
                 permissions = listOf(PERMISSION),
                 rationaleTitle = TextRef.AndroidRes(R.string.permission_dexcom_title),
@@ -99,16 +101,60 @@ class DexcomPlugin(
             )
         ) else emptyList()
 
-    private fun isDexcomAppInstalled(): Boolean =
-        PACKAGE_NAMES.any { pkg ->
-            try {
-                @Suppress("DEPRECATION")
-                context.packageManager.getPackageInfo(pkg, 0)
-                true
-            } catch (_: Exception) {
-                false
+    private enum class DexcomPermissionState { NO_COMPANION, REQUIRED, NOT_REQUIRED }
+
+    private fun dexcomPermissionState(): DexcomPermissionState {
+        try {
+            val packageManager = context.packageManager ?: return DexcomPermissionState.REQUIRED
+            val companions = mutableListOf<PackageInfo>()
+            for (pkg in PACKAGE_NAMES) {
+                val info = try {
+                    @Suppress("DEPRECATION")
+                    packageManager.getPackageInfo(pkg, PackageManager.GET_PERMISSIONS or PackageManager.GET_SIGNING_CERTIFICATES)
+                } catch (_: PackageManager.NameNotFoundException) {
+                    continue
+                }
+                if (info == null || info.packageName != pkg) return DexcomPermissionState.REQUIRED
+                if (info.permissions?.any { it.name == PERMISSION } == true ||
+                    info.requestedPermissions?.contains(PERMISSION) == true
+                ) return DexcomPermissionState.REQUIRED
+                if (info.permissions?.any { it.name.isNullOrBlank() } == true ||
+                    info.requestedPermissions?.any { it.isNullOrBlank() } == true
+                ) return DexcomPermissionState.REQUIRED
+                companions.add(info)
             }
+            if (companions.isEmpty()) return DexcomPermissionState.NO_COMPANION
+
+            try {
+                packageManager.getPermissionInfo(PERMISSION, 0)
+                return DexcomPermissionState.REQUIRED
+            } catch (_: PackageManager.NameNotFoundException) {
+                // Not found alone is not proof of absence: Android can filter permission owners.
+            }
+
+            // Only this known permission-free DiaKEM build is exempt. Permission evidence above
+            // takes priority even when the version and current signing certificate match.
+            val g7 = companions.singleOrNull() ?: return DexcomPermissionState.REQUIRED
+            return if (g7.packageName == "com.dexcom.g7" &&
+                g7.versionName == "1.6.1.4537" && g7.longVersionCode == 4537L &&
+                // The known APK requests other permissions; require that metadata to be present.
+                !g7.requestedPermissions.isNullOrEmpty() && hasKnownDiakemSigner(g7)
+            ) DexcomPermissionState.NOT_REQUIRED else DexcomPermissionState.REQUIRED
+        } catch (e: Exception) {
+            aapsLogger.error(LTag.BGSOURCE, "Cannot read Dexcom permission metadata", e)
+            return DexcomPermissionState.REQUIRED
         }
+    }
+
+    private fun hasKnownDiakemSigner(info: PackageInfo): Boolean {
+        val signingInfo = info.signingInfo ?: return false
+        if (signingInfo.hasMultipleSigners()) return false
+        // This private fixed-build exception matches the current signer only, not signing history.
+        val certificate = signingInfo.apkContentsSigners?.singleOrNull()?.toByteArray() ?: return false
+        if (certificate.isEmpty()) return false
+        val fingerprint = MessageDigest.getInstance("SHA-256").digest(certificate).joinToString("") { "%02x".format(it) }
+        return fingerprint == DIAKEM_SIGNER_SHA256
+    }
 
     override suspend fun onStart() {
         super.onStart()
@@ -255,6 +301,7 @@ class DexcomPlugin(
     }
 
     override fun requestPermissionIfNeeded() {
+        if (dexcomPermissionState() == DexcomPermissionState.NOT_REQUIRED) return
         if (ContextCompat.checkSelfPermission(context, PERMISSION) != PackageManager.PERMISSION_GRANTED) {
             val intent = Intent(context, RequestDexcomPermissionActivity::class.java)
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -266,6 +313,7 @@ class DexcomPlugin(
 
     companion object {
 
+        private const val DIAKEM_SIGNER_SHA256 = "64fd98526c04591081a2385cdba6c480b775e02369caf6b821e086705ebcb2c7"
         private val PACKAGE_NAMES = listOf(
             "com.dexcom.g6.region1.mmol", "com.dexcom.g6.region2.mgdl",
             "com.dexcom.g6.region3.mgdl", "com.dexcom.g6.region3.mmol",
